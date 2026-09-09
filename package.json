@@ -1,0 +1,38 @@
+{
+  "name": "@ezraapple/switchboard",
+  "version": "0.1.0",
+  "description": "One local MCP for sessions across agent harnesses.",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "switchboard": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "scripts/prepare-pty.mjs"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "tsx --test test/*.test.ts",
+    "test:live": "tsx test/lifecycle.ts",
+    "prepack": "npm run build",
+    "postinstall": "node scripts/prepare-pty.mjs",
+    "pretest": "npm run build",
+    "format:check": "prettier --check src test scripts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "node-pty": "^1.1.0",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "prettier": "^3.9.6",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  }
+}
