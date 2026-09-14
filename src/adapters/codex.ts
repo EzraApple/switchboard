@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { codexHome, stateDirectory } from "../config.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolve, relative, isAbsolute } from "node:path";
@@ -32,52 +35,100 @@ const projectsSchema = z.object({
   ),
   nextCursor: z.string().nullish(),
 });
-type Engine = Pick<CodexEngine, "call" | "close">;
-type Desktop = Pick<CodexIPC, "send" | "broadcast" | "close">;
+type Engine = Pick<CodexEngine, "call"> & {
+  close(): void | Promise<void>;
+  transport?: string;
+};
+type Desktop = Pick<CodexIPC, "send" | "broadcast" | "close" | "findOwner">;
 export class CodexAdapter implements Adapter {
   private engineInstance: Engine | undefined;
-  private readonly owned = new Set<string>();
+  private readonly owned = new Map<string, Engine>();
+  private readonly queues = new Map<string, Promise<unknown>>();
+  private readonly createEngine: (
+    onNotification: (method: string, params: unknown) => void,
+  ) => Engine;
   private readonly store: Pick<CodexStore, "search" | "get" | "read">;
   private readonly openDesktop: () => Promise<Desktop>;
   constructor(
     options: {
       engine?: Engine;
+      createEngine?: (
+        onNotification: (method: string, params: unknown) => void,
+      ) => Engine;
       store?: Pick<CodexStore, "search" | "get" | "read">;
       openDesktop?: () => Promise<Desktop>;
     } = {},
   ) {
     this.engineInstance = options.engine;
+    this.createEngine =
+      options.createEngine ??
+      (options.engine
+        ? () => options.engine!
+        : (notify) => new CodexEngine(notify, sharedDaemonSocket()));
     this.store = options.store ?? new CodexStore();
     this.openDesktop = options.openDesktop ?? (() => CodexIPC.open());
   }
   private get engine() {
-    return (this.engineInstance ??= new CodexEngine());
+    return (this.engineInstance ??= new CodexEngine(
+      undefined,
+      sharedDaemonSocket(),
+    ));
   }
   async search(input: SearchInput) {
     return this.store.search(input);
   }
   async read(input: ReadInput) {
-    return this.store.read(input);
+    const transcript = await this.store.read(input);
+    const { nativeId } = parseSessionId(input.session_id);
+    const connection =
+      this.owned.get(nativeId)?.transport ??
+      (this.owned.has(nativeId) ? "codex_app_server" : "none");
+    const state = { ...transcript, switchboard_connection: connection };
+    try {
+      const desktop = await this.openDesktop();
+      try {
+        const owner = await desktop.findOwner(nativeId);
+        return {
+          ...state,
+          desktop_owner_available: owner !== null,
+        };
+      } finally {
+        desktop.close();
+      }
+    } catch (error) {
+      return {
+        ...state,
+        desktop_owner_available: null,
+        ownership_error: errorMessage(error),
+      };
+    }
   }
   async create(input: CreateInput): Promise<Result> {
     const projectId = await this.findProject(input.cwd);
-    const created = z.object({ thread: z.object({ id: z.string() }) }).parse(
-      await this.engine.call({
-        method: "thread/start",
-        params: {
-          cwd: input.cwd,
-          ...(input.model ? { model: input.model } : {}),
-          ...(projectId ? { projectId } : {}),
-        },
-      }),
-    );
+    const engine = this.newTurnEngine();
+    let created;
+    try {
+      created = z.object({ thread: z.object({ id: z.string() }) }).parse(
+        await engine.call({
+          method: "thread/start",
+          params: {
+            cwd: input.cwd,
+            ...(input.model ? { model: input.model } : {}),
+            ...(projectId ? { projectId } : {}),
+          },
+        }),
+      );
+    } catch (error) {
+      await engine.close();
+      throw error;
+    }
     const nativeId = created.thread.id,
       sessionId = `codex:${nativeId}`;
-    this.owned.add(nativeId);
+    this.owned.set(nativeId, engine);
     let result: Result;
     try {
       if (input.title)
-        await this.engine.call({
+        await engine.call({
           method: "thread/name/set",
           params: { threadId: nativeId, name: input.title },
         });
@@ -97,6 +148,10 @@ export class CodexAdapter implements Adapter {
     return result;
   }
   async send(input: SendInput): Promise<Result> {
+    const { nativeId } = parseSessionId(input.session_id);
+    return this.serialize(nativeId, () => this.sendTurn(input));
+  }
+  private async sendTurn(input: SendInput): Promise<Result> {
     const { nativeId } = parseSessionId(input.session_id);
     const row = this.store.get(input.session_id);
     if (row.archived) throw new Error("Unarchive the session before sending");
@@ -143,18 +198,24 @@ export class CodexAdapter implements Adapter {
         )
           throw error;
       }
-      await this.engine.call({
-        method: "thread/resume",
-        params: { threadId: nativeId, excludeTurns: true },
-      });
-      this.owned.add(nativeId);
+      const engine = this.newTurnEngine();
+      try {
+        await engine.call({
+          method: "thread/resume",
+          params: { threadId: nativeId, excludeTurns: true },
+        });
+        this.owned.set(nativeId, engine);
+      } catch (error) {
+        await engine.close();
+        throw error;
+      }
     }
     const transcript = await this.store.read({
       session_id: input.session_id,
       limit: 1,
     });
     const active = transcript.status === "active";
-    const response = await this.engine.call({
+    const response = await this.owned.get(nativeId)!.call({
       method: active ? "turn/steer" : "turn/start",
       params: {
         threadId: nativeId,
@@ -170,10 +231,15 @@ export class CodexAdapter implements Adapter {
       session_id: input.session_id,
       status: "accepted",
       turn_id: turnId,
-      transport: "codex_app_server",
+      transport: this.owned.get(nativeId)?.transport ?? "codex_app_server",
     };
   }
   async update(input: UpdateInput): Promise<Result> {
+    return this.serialize(parseSessionId(input.session_id).nativeId, () =>
+      this.updateSession(input),
+    );
+  }
+  private async updateSession(input: UpdateInput): Promise<Result> {
     const { nativeId } = parseSessionId(input.session_id);
     const applied: string[] = [],
       result: Result = {
@@ -183,7 +249,7 @@ export class CodexAdapter implements Adapter {
       };
     try {
       if (input.title !== undefined) {
-        await this.engine.call({
+        await (this.owned.get(nativeId) ?? this.engine).call({
           method: "thread/name/set",
           params: { threadId: nativeId, name: input.title },
         });
@@ -191,10 +257,11 @@ export class CodexAdapter implements Adapter {
         await this.refresh({ result, nativeId });
       }
       if (input.archived !== undefined) {
-        await this.engine.call({
+        await (this.owned.get(nativeId) ?? this.engine).call({
           method: input.archived ? "thread/archive" : "thread/unarchive",
           params: { threadId: nativeId },
         });
+        await this.owned.get(nativeId)?.close();
         this.owned.delete(nativeId);
         applied.push("archived");
         await this.refresh({ result, nativeId, archived: input.archived });
@@ -208,15 +275,71 @@ export class CodexAdapter implements Adapter {
     }
   }
   async delete(input: DeleteInput): Promise<Result> {
+    return this.serialize(parseSessionId(input.session_id).nativeId, () =>
+      this.deleteSession(input),
+    );
+  }
+  private async deleteSession(input: DeleteInput): Promise<Result> {
     const { nativeId } = parseSessionId(input.session_id);
-    await this.engine.call({
+    await (this.owned.get(nativeId) ?? this.engine).call({
       method: "thread/delete",
       params: { threadId: nativeId },
     });
+    await this.owned.get(nativeId)?.close();
     this.owned.delete(nativeId);
     const result: Result = { session_id: input.session_id, status: "deleted" };
     await this.refresh({ result, nativeId, archived: true });
     return result;
+  }
+  private newTurnEngine() {
+    const activeTurns = new Set<string>();
+    const threadIds = new Set<string>();
+    const engine = this.createEngine((method, params) => {
+      const parsed = z
+        .object({ threadId: z.string(), turn: z.object({ id: z.string() }) })
+        .safeParse(params);
+      if (!parsed.success) return;
+      const { turn, threadId } = parsed.data;
+      threadIds.add(threadId);
+      if (method === "turn/started") activeTurns.add(turn.id);
+      if (method !== "turn/completed") return;
+      activeTurns.delete(turn.id);
+      const ownerId = [...this.owned].find(
+        ([, value]) => value === engine,
+      )?.[0];
+      if (!ownerId) return;
+      void this.serialize(ownerId, async () => {
+        if (this.owned.get(ownerId) !== engine || activeTurns.size > 0) return;
+        for (const threadId of threadIds) {
+          const terminals = z.object({ data: z.array(z.unknown()) }).parse(
+            await engine.call({
+              method: "thread/backgroundTerminals/list",
+              params: { threadId },
+            }),
+          );
+          // A completed answer must not terminate a server the task left running.
+          if (terminals.data.length > 0) return;
+        }
+        if (activeTurns.size > 0) return;
+        await engine.close();
+        this.owned.delete(ownerId);
+        await this.refresh({ nativeId: ownerId, result: {} });
+      }).catch((error) =>
+        console.error("Codex ownership release failed:", errorMessage(error)),
+      );
+    });
+    return engine;
+  }
+  private serialize<T>(nativeId: string, action: () => Promise<T>): Promise<T> {
+    const previous = this.queues.get(nativeId) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(action);
+    this.queues.set(nativeId, next);
+    void next
+      .finally(() => {
+        if (this.queues.get(nativeId) === next) this.queues.delete(nativeId);
+      })
+      .catch(() => {});
+    return next;
   }
   private async refresh({
     result,
@@ -292,7 +415,8 @@ export class CodexAdapter implements Adapter {
     return first.id;
   }
   close() {
-    this.engineInstance?.close();
+    void this.engineInstance?.close();
+    for (const engine of this.owned.values()) void engine.close();
   }
 }
 async function gitCommonDirectory(cwd: string) {
@@ -307,4 +431,22 @@ async function gitCommonDirectory(cwd: string) {
   } catch {
     return null;
   }
+}
+
+function sharedDaemonSocket(): string | undefined {
+  let preferences: unknown;
+  try {
+    preferences = JSON.parse(
+      readFileSync(join(stateDirectory, "preferences.json"), "utf8"),
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  const parsed = z
+    .object({ codex_shared_daemon: z.boolean().optional() })
+    .parse(preferences);
+  return parsed.codex_shared_daemon
+    ? join(codexHome, "app-server-control", "app-server-control.sock")
+    : undefined;
 }

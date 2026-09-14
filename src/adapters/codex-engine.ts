@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
+import WebSocket from "ws";
 import { createInterface } from "node:readline";
 import { z } from "zod";
 import { OperationError } from "../errors.js";
@@ -13,7 +14,9 @@ const messageSchema = z
   })
   .loose();
 export class CodexEngine {
-  private readonly process: ChildProcessWithoutNullStreams;
+  private readonly process?: ChildProcessWithoutNullStreams;
+  private readonly socket?: WebSocket;
+  readonly transport: "codex_app_server" | "codex_shared_daemon";
   private readonly pending = new Map<
     number,
     {
@@ -25,31 +28,59 @@ export class CodexEngine {
   private nextId = 0;
   private exited = false;
   private readonly ready: Promise<unknown>;
-  constructor() {
+  constructor(
+    private readonly onNotification?: (method: string, params: unknown) => void,
+    sharedSocket?: string,
+  ) {
     const desktopBinary = "/Applications/ChatGPT.app/Contents/Resources/codex";
     const binary =
       process.env.SWITCHBOARD_CODEX_BIN ??
       (existsSync(desktopBinary) ? desktopBinary : "codex");
-    this.process = spawn(binary, ["app-server"], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    this.process.stderr.resume();
-    createInterface({ input: this.process.stdout }).on("line", (line) =>
-      this.receive(line),
-    );
-    this.process.on("error", () => this.failPending());
-    this.process.on("exit", () => this.failPending());
-    this.process.stdin.on("error", () => this.failPending());
-    this.ready = this.request({
-      method: "initialize",
-      params: {
-        clientInfo: { name: "switchboard", version: "0.1.0" },
-        capabilities: { experimentalApi: true },
-      },
-    }).then((result) => {
-      this.write({ method: "initialized" });
-      return result;
-    });
+    let connected: Promise<void>;
+    if (sharedSocket) {
+      const info = lstatSync(sharedSocket);
+      if (!info.isSocket() || info.uid !== process.getuid?.())
+        throw new Error("Shared Codex socket must belong to the current user");
+      this.transport = "codex_shared_daemon";
+      this.socket = new WebSocket(`ws+unix://localhost${sharedSocket}:/rpc`, {
+        handshakeTimeout: 10000,
+        perMessageDeflate: false,
+      });
+      this.socket.on("message", (data) => this.receive(data.toString()));
+      this.socket.on("close", () => this.failPending());
+      connected = new Promise((resolve, reject) => {
+        this.socket!.once("open", resolve);
+        this.socket!.once("error", reject);
+      });
+      this.socket.on("error", () => this.failPending());
+    } else {
+      this.transport = "codex_app_server";
+      connected = Promise.resolve();
+      this.process = spawn(binary, ["app-server"], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      this.process.stderr.resume();
+      createInterface({ input: this.process.stdout }).on("line", (line) =>
+        this.receive(line),
+      );
+      this.process.on("error", () => this.failPending());
+      this.process.on("exit", () => this.failPending());
+      this.process.stdin.on("error", () => this.failPending());
+    }
+    this.ready = connected
+      .then(() =>
+        this.request({
+          method: "initialize",
+          params: {
+            clientInfo: { name: "switchboard", version: "0.1.0" },
+            capabilities: { experimentalApi: true },
+          },
+        }),
+      )
+      .then((result) => {
+        this.write({ method: "initialized" });
+        return result;
+      });
     void this.ready.catch(() => {});
   }
   async call({
@@ -92,7 +123,8 @@ export class CodexEngine {
     });
   }
   private write(message: unknown) {
-    this.process.stdin.write(JSON.stringify(message) + "\n");
+    if (this.socket) this.socket.send(JSON.stringify(message));
+    else this.process!.stdin.write(JSON.stringify(message) + "\n");
   }
   private receive(line: string) {
     let value: unknown;
@@ -105,7 +137,7 @@ export class CodexEngine {
     if (!parsed.success) return;
     const message = parsed.data;
     if (message.method) {
-      if (message.id !== undefined)
+      if (message.id !== undefined && !this.socket)
         this.write({
           id: message.id,
           error: {
@@ -114,6 +146,7 @@ export class CodexEngine {
               "Switchboard cannot answer native approvals or user-input requests. Continue in the owning app.",
           },
         });
+      else this.onNotification?.(message.method, message.params);
       return;
     }
     if (typeof message.id !== "number") return;
@@ -146,7 +179,17 @@ export class CodexEngine {
     }
     this.pending.clear();
   }
-  close() {
-    this.process.kill();
+  close(): Promise<void> {
+    if (this.exited) return Promise.resolve();
+    if (this.socket)
+      return new Promise((resolve) => {
+        this.socket!.once("close", () => resolve());
+        this.socket!.close();
+      });
+    return new Promise((resolve) => {
+      this.process!.once("exit", () => resolve());
+      // EOF lets app-server flush the completed turn and release its writer.
+      this.process!.stdin.end();
+    });
   }
 }

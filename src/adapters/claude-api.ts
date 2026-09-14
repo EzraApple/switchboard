@@ -23,8 +23,13 @@ export class ClaudeAPI {
     path: string;
     body?: unknown;
   }): Promise<unknown> {
-    if (!/^\/v1\/code\/sessions(?:$|[/?])/.test(path))
-      throw new Error("Only the Claude session API is allowed");
+    if (
+      !/^\/v1\/code\/sessions(?:$|[/?])/.test(path) &&
+      !(method === "GET" && path === "/v1/environment_providers")
+    )
+      throw new Error(
+        "Only the Claude session API and read-only environment discovery are allowed",
+      );
     if (process.platform !== "darwin")
       throw new Error(
         "Claude login discovery currently requires macOS Keychain",

@@ -181,6 +181,22 @@ export class CodexIPC {
       else pending.resolve(response);
     }
   }
+  async findOwner(nativeId: string): Promise<string | null> {
+    try {
+      const owner = await this.request({
+        method: "thread-owner-discovery",
+        params: { hostId: "local", conversationId: nativeId },
+      });
+      return owner.handledByClientId ?? null;
+    } catch (error) {
+      if (
+        error instanceof DesktopRejection &&
+        error.reason === "no-client-found"
+      )
+        return null;
+      throw error;
+    }
+  }
   async send({
     nativeId,
     prompt,
@@ -192,17 +208,14 @@ export class CodexIPC {
     cwd: string;
     active: boolean;
   }) {
-    const owner = await this.request({
-      method: "thread-owner-discovery",
-      params: { hostId: "local", conversationId: nativeId },
-    });
-    if (!owner.handledByClientId) throw new DesktopRejection("no-client-found");
+    const ownerId = await this.findOwner(nativeId);
+    if (!ownerId) throw new DesktopRejection("no-client-found");
     const input = [{ type: "text", text: prompt, text_elements: [] }];
     if (!active)
       return this.request({
         method: "thread-follower-start-turn",
         version: 2,
-        targetClientId: owner.handledByClientId,
+        targetClientId: ownerId,
         params: {
           conversationId: nativeId,
           turnStart: {
@@ -214,7 +227,7 @@ export class CodexIPC {
     const messageId = randomUUID();
     return this.request({
       method: "thread-follower-steer-turn",
-      targetClientId: owner.handledByClientId,
+      targetClientId: ownerId,
       params: {
         conversationId: nativeId,
         input,

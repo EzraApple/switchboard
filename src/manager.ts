@@ -48,7 +48,7 @@ export class SessionManager {
             sessions,
             errors,
             search_scope:
-              "Codex titles/directories; Claude Remote Control titles",
+              "Codex titles/directories; Claude Desktop titles/directories and Remote Control sessions",
           };
         }
         case "create_session": {

@@ -4,7 +4,9 @@ export const harnessSchema = z.enum(["codex", "claude"]);
 export type Harness = z.infer<typeof harnessSchema>;
 const sessionId = z
   .string()
-  .regex(/^(codex:[0-9a-f-]{36}|claude:(?:cse|session)_[A-Za-z0-9]+)$/)
+  .regex(
+    /^(codex:[0-9a-f-]{36}|claude:(?:(?:cse|session)_[A-Za-z0-9]+|local_[0-9a-f-]{36}))$/,
+  )
   .describe("Native ID prefixed with its harness.");
 const text = z
   .string()
@@ -71,17 +73,17 @@ export function parseSessionId(value: string) {
   if (parsedHarness === "codex") z.uuid().parse(nativeId);
   else
     z.string()
-      .regex(/^(cse|session)_[A-Za-z0-9]+$/)
+      .regex(/^(?:(?:cse|session)_[A-Za-z0-9]+|local_[0-9a-f-]{36})$/)
       .parse(nativeId);
   return { harness: parsedHarness, nativeId };
 }
 export const descriptions: Record<Operation, string> = {
   search_sessions:
-    "Search native sessions across harnesses. Codex searches titles/directories; Claude searches Remote Control titles. Local-only Claude sessions are outside this surface.",
+    "Search native sessions across harnesses. Claude includes Desktop titles/directories and mapped Remote Control identities. Local-only sessions report their connection limitation.",
   read_session:
     "Read recent user/assistant text and status, excluding reasoning. Verify replies here: send acceptance is not completion.",
   create_session:
-    "Create and prompt a session through a separate local engine without changing focus. cwd sets execution location; Desktop grouping and immediate visibility are not guaranteed. Claude requires workspace trust. model is the native model name. If created=true, inspect the returned ID instead of creating again.",
+    "Create and prompt a session through the configured local engine transport without changing focus. cwd sets execution location; Desktop grouping and immediate visibility are not guaranteed. Claude requires workspace trust. model is the native model name. If created=true, inspect the returned ID instead of creating again.",
   send_message:
     "Send a follow-up while preserving native permission checks. Returns acceptance, not completion. No automatic retry after uncertain delivery. Archived sessions must first be restored.",
   update_session:

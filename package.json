@@ -10,6 +10,7 @@
   "files": [
     "dist",
     "README.md",
+    "TESTING.md",
     "scripts/prepare-pty.mjs"
   ],
   "engines": {
@@ -27,12 +28,22 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "node-pty": "^1.1.0",
+    "ws": "^8.21.3",
     "zod": "^4.5.4"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
+    "@types/ws": "^8.18.1",
     "prettier": "^3.9.6",
     "tsx": "^4.23.13",
     "typescript": "^7.0.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EzraApple/switchboard.git"
+  },
+  "homepage": "https://github.com/EzraApple/switchboard#readme",
+  "bugs": {
+    "url": "https://github.com/EzraApple/switchboard/issues"
   }
 }
