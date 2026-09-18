@@ -25,10 +25,22 @@ export class ClaudeAPI {
   }): Promise<unknown> {
     if (
       !/^\/v1\/code\/sessions(?:$|[/?])/.test(path) &&
-      !(method === "GET" && path === "/v1/environment_providers")
+      !(method === "GET" && path === "/v1/environment_providers") &&
+      !(
+        method === "POST" &&
+        /^\/v1\/environments\/env_[A-Za-z0-9]+\/bridge\/reconnect$/.test(
+          path,
+        ) &&
+        z
+          .object({
+            session_id: z.string().regex(/^(?:cse|session)_[A-Za-z0-9]+$/),
+          })
+          .strict()
+          .safeParse(body).success
+      )
     )
       throw new Error(
-        "Only the Claude session API and read-only environment discovery are allowed",
+        "Only the Claude session API, validated session reconnect, and read-only environment discovery are allowed",
       );
     if (process.platform !== "darwin")
       throw new Error(
@@ -60,7 +72,9 @@ export class ClaudeAPI {
           Authorization: `Bearer ${credentials.claudeAiOauth.accessToken}`,
           "Content-Type": "application/json",
           "anthropic-version": "2023-06-01",
-          "anthropic-beta": "ccr-byoc-2025-07-29",
+          "anthropic-beta": path.startsWith("/v1/environments/")
+            ? "ccr-byoc-2025-07-29,environments-2025-11-01"
+            : "ccr-byoc-2025-07-29",
           "anthropic-client-feature": "ccr",
           "x-organization-uuid": config.oauthAccount.organizationUuid,
         },

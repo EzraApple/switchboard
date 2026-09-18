@@ -7,6 +7,7 @@ import {
   type Result,
 } from "./contracts.js";
 import { errorMessage, failure } from "./errors.js";
+import { compareSessions } from "./search.js";
 import { workspaceDirectory } from "./files.js";
 
 export class SessionManager {
@@ -26,10 +27,16 @@ export class SessionManager {
             ? [input.harness]
             : ["codex", "claude"];
           const errors: Record<string, string> = {};
+          const warnings: string[] = [];
           const pages = await Promise.all(
             harnesses.map(async (harness) => {
               try {
-                return await this.adapters[harness].search(input);
+                const page = await this.adapters[harness].search(input);
+                if (Array.isArray(page)) return page;
+                warnings.push(
+                  ...page.warnings.map((warning) => `${harness}: ${warning}`),
+                );
+                return page.sessions;
               } catch (error) {
                 if (input.harness) throw error;
                 errors[harness] = errorMessage(error);
@@ -39,16 +46,14 @@ export class SessionManager {
           );
           const sessions = pages
             .flat()
-            .sort(
-              (left, right) =>
-                timestamp(right.updated_at) - timestamp(left.updated_at),
-            )
+            .sort(compareSessions)
             .slice(0, input.limit);
           return {
             sessions,
             errors,
+            warnings,
             search_scope:
-              "Codex titles/directories; Claude Desktop titles/directories and Remote Control sessions",
+              "Titles, directories, and visible user/assistant text; check warnings for unavailable or incomplete sources",
           };
         }
         case "create_session": {
@@ -96,9 +101,4 @@ export class SessionManager {
   close() {
     for (const adapter of Object.values(this.adapters)) adapter.close();
   }
-}
-function timestamp(value: string | number | null | undefined) {
-  if (typeof value === "number") return value;
-  if (typeof value === "string") return Date.parse(value) / 1000 || 0;
-  return 0;
 }

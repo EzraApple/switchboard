@@ -195,7 +195,6 @@ export async function serveDaemon() {
     codex: new CodexAdapter(),
     claude: new ClaudeAdapter(),
   });
-  let queue = Promise.resolve();
   const server = createServer((socket) => {
     let buffer = Buffer.alloc(0),
       dispatched = false;
@@ -211,37 +210,35 @@ export async function serveDaemon() {
       const newline = buffer.indexOf(10);
       if (newline < 0) return;
       dispatched = true;
-      queue = queue
-        .then(async () => {
-          let result: Result;
-          try {
-            const request = requestSchema.parse(
-              JSON.parse(buffer.subarray(0, newline).toString()),
-            );
-            result = await manager.execute(request);
-          } catch (error) {
-            result = failure({ error });
-          }
-          const response = JSON.stringify({ protocol: 1, result }) + "\n";
-          if (Buffer.byteLength(response) > limit)
-            socket.end(
-              JSON.stringify({
-                protocol: 1,
-                result: failure({
-                  error: new OperationError(
-                    "OUTCOME_UNKNOWN",
-                    "Result too large; inspect using a smaller read limit.",
-                  ),
-                }),
-              }) + "\n",
-            );
-          else socket.end(response);
-        })
-        .catch((error) => {
-          console.error(
-            error instanceof Error ? error.message : "Request failed",
+      void (async () => {
+        let result: Result;
+        try {
+          const request = requestSchema.parse(
+            JSON.parse(buffer.subarray(0, newline).toString()),
           );
-        });
+          result = await manager.execute(request);
+        } catch (error) {
+          result = failure({ error });
+        }
+        const response = JSON.stringify({ protocol: 1, result }) + "\n";
+        if (Buffer.byteLength(response) > limit)
+          socket.end(
+            JSON.stringify({
+              protocol: 1,
+              result: failure({
+                error: new OperationError(
+                  "OUTCOME_UNKNOWN",
+                  "Result too large; inspect using a smaller read limit.",
+                ),
+              }),
+            }) + "\n",
+          );
+        else socket.end(response);
+      })().catch((error) => {
+        console.error(
+          error instanceof Error ? error.message : "Request failed",
+        );
+      });
     });
   });
   await new Promise<void>((resolve, reject) => {

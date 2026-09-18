@@ -10,7 +10,7 @@ The goal is to work with sessions you can see in your Desktop apps. Native sessi
 
 - macOS: Claude login discovery currently uses macOS Keychain.
 - Node.js 22.13 or newer. Local tests used Node 22.22.2, pinned in `.node-version`.
-- Installed, signed-in Codex and Claude Code, with Claude Remote Control available for your account.
+- Installed, signed-in Codex and Claude Code, with Claude Remote Control available for your account. Dormant local Claude wake requires a CLI with `--bg --resume` (verified with 2.1.274 and 2.1.275).
 - An existing local working directory that you have already opened and trusted in Claude Code.
 
 Claude session creation uses the **Claude Code CLI login**, which is separate from being signed into Claude Desktop. Check `claude auth status`; if it reports logged out, run `claude auth login --claudeai` and complete its browser flow. Switchboard does not refresh expired OAuth tokens itself.
@@ -101,6 +101,16 @@ Harness names are `codex` and `claude`. IDs retain their native identity with a 
 
 Archive is reversible with `archived: false`. Delete targets the actual native session, not just a Switchboard listing.
 
+### Finding past conversations
+
+`search_sessions` searches titles, working directories, and user/assistant text. For example, `query: "preview revocation"` can find a discussion even when neither word appears in its title. All significant words must match somewhere in the conversation; English word stemming and prefix matching accommodate variants such as “reconnect” and “reconnecting.” This is keyword retrieval, not semantic or synonym search. Use a few distinctive topic words.
+
+Results include `relevance_score` and `match_snippet`, with matching text in brackets. Titles have extra ranking weight; recency breaks ties. An empty query lists recent sessions. `archived: true` searches archived sessions separately. Limits apply after ranking across the selected harnesses.
+
+Codex and Claude Desktop search complete available local transcripts. Remote-only Claude sessions use paginated event history. `warnings` identifies missing files, API failures, or histories that exceed the indexing time budget; repeat the search to index remaining sessions. Local Claude titles and transcripts remain searchable when its API is unavailable.
+
+The first content search populates `search.sqlite` in the Switchboard state directory. Later searches reuse unchanged files and remote session metadata; connected remote sessions refresh at most every 30 seconds. The database is private to your OS user and can be deleted while Switchboard is stopped to rebuild it from native history.
+
 ### Understanding results
 
 - Send acceptance means submitted; use `read_session` to observe completion.
@@ -110,6 +120,9 @@ Archive is reversible with `archived: false`. Delete targets the actual native s
 - `SESSION_OWNED_ELSEWHERE` means another Codex engine owns the task. Switchboard does not force ownership transfer.
 - `OUTCOME_UNKNOWN` means inspect before retrying: the operation may already have happened.
 - `DESKTOP_REFRESH_FAILED` concerns UI refresh; it does not undo a successful mutation.
+- `resumed: true` means Switchboard woke the original Claude conversation before submitting the message. It is still necessary to read back the reply.
+- `CLAUDE_BACKGROUND_UNSUPPORTED` means the configured Claude executable needs an update. `CLAUDE_WAKE_NOT_READY` means it started but may be waiting on native login/trust or lacks a ready inbox.
+- `CLAUDE_WAKE_IDENTITY_MISMATCH` means native resume produced an unexpected identity, so no message was sent. Inspect before retrying.
 
 ## Architecture
 
@@ -124,11 +137,11 @@ Codex / Claude Code / another MCP host
   separate App Server     session API + Remote Control
 ```
 
-The daemon keeps native workers alive after individual MCP clients disconnect and serializes lifecycle requests. Each adapter implements the same typed contract. The caller does not need a Codex task ID or Codex's built-in app tools. The runtime does not use Computer Use or activate UI.
+The daemon keeps native workers alive after individual MCP clients disconnect and serializes mutations per session. Reads, search, and unrelated sessions can proceed while another session starts or reconnects. Each adapter implements the same typed contract. The caller does not need a Codex task ID or Codex's built-in app tools. The runtime does not use Computer Use or activate UI.
 
-Codex uses one installed App Server per active task and closes that engine after completion, allowing Desktop to acquire the task. Tasks with active child turns or background terminals retain their engine; background-terminal cleanup is checked again at the next turn completion. Discovery uses read-only SQLite/JSONL for discovery and history, and optional Desktop IPC for existing-owner messages and sidebar refresh. Claude discovers Desktop titles and directories from local metadata, reads text from local transcripts, and messages running Desktop owners through authenticated local peer IPC. Remote sessions and creation use the existing Keychain login in memory, a session API, and Remote Control workers. Claude's session API and Codex Desktop IPC are private contracts, not stable public integrations.
+Codex uses one installed App Server per active task and closes that engine after completion, allowing Desktop to acquire the task. Tasks with active child turns or background terminals retain their engine; background-terminal cleanup is checked again at the next turn completion. Discovery uses read-only native SQLite/JSONL plus a private, rebuildable text-search index, and optional Desktop IPC for existing-owner messages and sidebar refresh. Claude discovers Desktop titles and directories from local metadata, reads text from local transcripts, and messages running Desktop owners through authenticated local peer IPC. Remote sessions and creation use the existing Keychain login in memory, a session API, and Remote Control workers. Claude's session API and Codex Desktop IPC are private contracts, not stable public integrations.
 
-Credentials are sent only to the fixed Anthropic API origin and are not saved in Switchboard state. Local state and the Unix socket use owner-only permissions. Granting an MCP host access gives it session-management capabilities for your signed-in harnesses; native approval handling has the limits below.
+Credentials are sent only to the fixed Anthropic API origin and are not saved in Switchboard state. The search index contains user/assistant conversation text on this machine; it excludes reasoning and tool output and is not sent to an embedding service. Local state and the Unix socket use owner-only permissions. Granting an MCP host access gives it session-management capabilities for your signed-in harnesses; native approval handling has the limits below.
 
 ### Configuration and lifecycle
 
@@ -158,19 +171,23 @@ Removing registrations does not stop an existing daemon or delete native session
 
 ## Dormant Claude Desktop sessions
 
-Background-only operation is required. The native open-session link was tested: it woke the correct conversation and delivered a reply, but brought Claude forward. That fallback has been removed. Running Desktop sessions remain reachable over local peer IPC. Dormant Desktop sessions without a connected remote worker return an explicit failure without opening a window or launching a competing engine.
+`send_message` can wake a saved Desktop conversation when its original local transcript and CLI session ID are available. Switchboard invokes the installed Claude Code CLI with `--bg --resume`, verifies the full resumed identity, waits for its authenticated local peer inbox, then sends the requested message once. Callers still use the same MCP tool; no manual terminal step or helper chat is required.
+
+The background worker continues the original conversation and history without opening or focusing Desktop. This resumes the conversation's underlying CLI engine; it does not launch Desktop's own engine or guarantee that Desktop displays it as an active local tab. Native Desktop-only tools may be unavailable in the resumed CLI process. The CLI owns that background process and it survives Switchboard restarts. `claude agents` lists it; `claude stop <id>` stops it while retaining history. A later MCP send can wake it again.
+
+Native Claude may create a copy when another owner wins a startup race or when saved background options are changed. Switchboard reuses existing background options, checks identity before delivery, and stops a newly created unexpected copy without sending it a prompt. Already-running original owners are reused. Archived chats must be restored first; missing local transcripts and expired remote-only environments still require intervention. Native login, permissions, and workspace trust remain in effect.
 
 ## Current limits
 
 - Immediate visibility of new sessions and Desktop project grouping are not guaranteed.
 - A new Codex task may not stream its initial response in Desktop and may temporarily show “open in another app.” After the separate engine releases it and Desktop acquires it, Desktop-routed follow-ups have worked with streaming and an available composer in user testing. First-turn UI parity remains unresolved.
 - Existing Desktop-owned Codex tasks can reject lifecycle operations, even while idle.
-- Claude Desktop sessions are discoverable by their Desktop title. Running owners can receive local peer messages without Remote Control; dormant Desktop sessions cannot yet be reopened automatically.
+- Claude Desktop sessions are discoverable by title, directory, and available conversation text. Local transcripts can resume through background Claude Code without Remote Control. Missing transcripts and unsupported CLI versions cannot use this wake path.
 - Claude relays are attributed to Switchboard with peer authority. They are not human approvals. The local inbox has no synchronous delivery receipt; read the session to verify a response before retrying.
 - Claude Desktop title and lifecycle changes must use the owning app. Switchboard refuses to mutate only the remote mirror.
 - Native approval/user-input requests are not relayed through the six tools. The separate Codex engine reports unsupported requests rather than approving them.
 - Provider updates can break private API or IPC adapters. Compatibility has been tested locally, not across every installation or account tier.
-- Machine-reboot recovery, expired-login renewal, attachments, and complete transcript pagination remain unverified.
+- Machine-reboot recovery, expired-login renewal, and attachments remain unverified. `read_session` still returns a bounded recent window; content search pages through remote Claude history.
 - OpenCode is not implemented yet.
 
 ## Testing and contributing
@@ -186,6 +203,8 @@ The provisional package name is `@ezraapple/switchboard`; the unscoped name is t
 ## Claude worker behavior
 
 Claude worker hosts run as detached OS processes, retaining their PTYs across Switchboard daemon restarts without creating helper chats. A live session retained its identity, environment, connection, and ability to answer across a daemon restart. Stopping the native Remote Control server or rebooting can still end its sessions; boot recovery is not proven.
+
+Switchboard rediscovers the installed Claude executable on each worker launch so Desktop upgrades do not leave a cached path to a removed version. Disconnected sessions reuse a matching live folder environment through Claude’s reconnect API. When an older session belongs to a different environment, `CLAUDE_ENVIRONMENT_UNAVAILABLE` reports the limitation without starting a competing server or sending a message. Arbitrary expired remote environments remain unsupported; dormant Desktop conversations with local transcripts use the separate background-resume path described above.
 
 Switchboard launches new Claude workers with `--permission-mode auto`. Claude retains its auto-mode safety classifier and may still require approvals. Already-running chats retain their existing mode. New creation workers use a separate reuse key so they do not inherit an older worker’s default permission mode.
 

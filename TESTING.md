@@ -81,6 +81,30 @@ The user reported Codex → Claude working smoothly in normal use. For Codex cre
 
 On September 14, the current source built successfully, all 27 automated tests passed, and the source/test/script formatting check passed. A freshly packed tarball contained 46 allowlisted files (build output, docs, package metadata, and the install helper), installed successfully into a temporary directory, and exposed all six tools through its installed executable over MCP stdio. No real provider turns were started by that package smoke check. Earlier live lifecycle and cross-harness results above are dated historical evidence, not a fresh full lifecycle run of this revision.
 
+## September 18 session reliability and search
+
+All 35 focused tests, the build, formatting check, and `git diff --check` passed. The suite now covers transcript ranking/snippets, word stemming, archive filtering, index refresh, exclusion of reasoning/tool output, Claude history pagination, API-outage fallback, installed-executable upgrades, matching-environment reconnect, and Codex steering before transcript flush. Session mutations serialize by identity while reads and unrelated work remain concurrent.
+
+Native MCP checks on this installation reproduced Claude startup failure after Desktop removed the daemon’s cached executable version. After rediscovery and daemon reload, a new Claude probe returned `SWITCHBOARD_RELIABILITY_READY`; archive/restore plus a follow-up returned `SWITCHBOARD_RESTORE_VERIFIED`. A Codex probe accepted steering during its active first turn and returned `SWITCHBOARD_CODEX_STEERED`. That installation already used the experimental shared Codex transport; this is message-delivery evidence, not proof of an available Desktop composer.
+
+A read-only API probe verified Claude event pagination: the next cursor returned the preceding page rather than repeating the latest events. Live cross-harness content search returned matching snippets from both harnesses. One missing Codex transcript was reported explicitly. An old archived Claude test session exposed an environment mismatch; the attempted restore failed because another Remote Control environment served the same folder. Its original archived state was restored. Matching-environment reconnect avoids this competing-server path; genuinely different/expired environments remain a limitation.
+
+After adding the required environments beta header, the final build passed native MCP archive/restore, reconnect, send, and read: the probe returned `SWITCHBOARD_RECONNECT_FINAL_OK`. Searching that body-only token returned the same conversation and matching snippet with no warnings. Both new probe sessions were archived after validation.
+
+No Desktop windows were opened, native feature gates changed, or package published. Dormant Desktop wake and first-turn Codex composer parity remain unresolved.
+
+## September 18 dormant local Claude wake
+
+Claude Code 2.1.275 successfully resumed a dormant Desktop test conversation through its public `--bg --resume` CLI, retaining the full original CLI and Desktop IDs. The original history remained readable, and a subsequent peer message produced `SWITCHBOARD_DORMANT_RESUMED_OK`.
+
+Automatic MCP wake was then implemented behind `send_message`. Repeat-wake testing discovered that passing extra flags to an existing saved background job asks Claude to create a copy. The identity check prevented delivery to that copy and stopped it. Existing background jobs now resume with saved options and no extra flags. Tests cover concurrent wake coalescing, capability detection, original-ID validation, copy cleanup, startup uncertainty, archives, missing inboxes, and adapter delivery without remote fallback.
+
+The final native MCP check started with the original test conversation dormant. One `send_message` returned `resumed: true` through `claude_background_cli`; `read_session` then confirmed the actual reply `SWITCHBOARD_MCP_AUTO_WAKE_OK` under its original full identity. A foreground-app observer recorded no focus changes during the wake and reply. All 41 tests, the build, and formatting check passed.
+
+A fresh tarball contained 52 allowlisted files and installed successfully into a temporary directory. Its installed executable exposed all six tools over MCP stdio, and its isolated daemon read the verified reply from the original conversation. This package smoke check did not start provider turns. The isolated daemon was stopped afterward, and the original Claude test conversation was returned to its dormant state.
+
+This proves continuation of the original local conversation, not launch of Desktop's own engine or full Desktop UI/tool parity. Remote-only sessions with expired environments still need recovery outside this path.
+
 ## Package release checklist
 
 Before publishing the first package:
@@ -88,6 +112,6 @@ Before publishing the first package:
 - Run both harnesses' live lifecycle and reciprocal MCP checks against the final installed tarball, then inspect actual replies and Desktop follow-up behavior. Repeat with a clean setup or second installation to check onboarding assumptions.
 - Choose and add a license; the repository currently has no license file. Confirm the scoped package name, version, npm account access, and intended public visibility. Remove `private: true` only when ready to publish.
 - Verify the final tarball contents, fresh installation, executable entry point, and MCP tool discovery. Keep credentials, evidence, native session transcripts, and machine-specific state out of the package.
-- Keep shared Codex mode experimental. Document unsupported dormant Claude wake, CLI reauthentication, worker/reboot recovery, approval relay, and first-turn Codex UI behavior as preview limitations unless resolved before release.
+- Keep shared Codex mode experimental. Document dormant-wake CLI requirements and Desktop UI limitations, CLI reauthentication, worker/reboot recovery, approval relay, and first-turn Codex UI behavior as preview limitations unless resolved before release.
 
 The first three items are release gates. The last item bounds the preview's claims; full Desktop parity is not a prerequisite for an honestly labeled preview. This checklist does not authorize an npm publication.

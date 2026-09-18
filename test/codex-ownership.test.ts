@@ -131,3 +131,15 @@ test("completed answer preserves an engine with a running background terminal", 
   assert.equal(workers[0]!.closed, true);
   adapter.close();
 });
+
+test("active follow-ups steer from engine notifications even before the transcript is flushed", async () => {
+  const { adapter, workers } = fixture();
+  await adapter.send({ session_id: first, prompt: "start" });
+  await adapter.send({ session_id: first, prompt: "steer immediately" });
+  assert.deepEqual(workers[0]!.calls, [
+    "thread/resume",
+    "turn/start",
+    "turn/steer",
+  ]);
+  adapter.close();
+});

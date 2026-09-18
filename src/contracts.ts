@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { SearchPage } from "./search.js";
 
 export const harnessSchema = z.enum(["codex", "claude"]);
 export type Harness = z.infer<typeof harnessSchema>;
@@ -14,7 +15,7 @@ const text = z
 const limit = z.number().int().min(1).max(100);
 export const schemas = {
   search_sessions: z.object({
-    query: z.string().default(""),
+    query: z.string().max(1000).default(""),
     harness: harnessSchema.optional(),
     archived: z.boolean().default(false),
     limit: limit.default(20),
@@ -58,7 +59,7 @@ export type Summary = {
   cwd?: string;
 } & Result;
 export interface Adapter {
-  search(input: SearchInput): Promise<Summary[]>;
+  search(input: SearchInput): Promise<Summary[] | SearchPage>;
   read(input: ReadInput): Promise<Result>;
   create(input: CreateInput): Promise<Result>;
   send(input: SendInput): Promise<Result>;
@@ -79,13 +80,13 @@ export function parseSessionId(value: string) {
 }
 export const descriptions: Record<Operation, string> = {
   search_sessions:
-    "Search native sessions across harnesses. Claude includes Desktop titles/directories and mapped Remote Control identities. Local-only sessions report their connection limitation.",
+    "Search titles, directories, and user/assistant conversation text across both harnesses. All significant query words must match (stemmed and prefix-matched); results are relevance-ranked with match snippets. Empty query lists recent sessions. Check warnings for incomplete remote history or unavailable sources; reasoning and tool output are excluded.",
   read_session:
     "Read recent user/assistant text and status, excluding reasoning. Verify replies here: send acceptance is not completion.",
   create_session:
     "Create and prompt a session through the configured local engine transport without changing focus. cwd sets execution location; Desktop grouping and immediate visibility are not guaranteed. Claude requires workspace trust. model is the native model name. If created=true, inspect the returned ID instead of creating again.",
   send_message:
-    "Send a follow-up while preserving native permission checks. Returns acceptance, not completion. No automatic retry after uncertain delivery. Archived sessions must first be restored.",
+    "Send a follow-up while preserving native permission checks. Dormant Claude Desktop conversations with local transcripts are resumed in background Claude Code without opening Desktop. Returns submission, not completion. No automatic retry after uncertain delivery. Archived sessions must first be restored.",
   update_session:
     "Rename, archive, or restore a session. Check applied fields on partial failure. SESSION_OWNED_ELSEWHERE means use the owning app; idle does not release ownership. Refresh warnings do not undo changes.",
   delete_session:

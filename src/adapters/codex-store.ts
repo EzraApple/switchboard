@@ -1,9 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
 import { createReadStream } from "node:fs";
-import { access } from "node:fs/promises";
+import { access, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { z } from "zod";
+import { SessionSearchIndex, compareSessions } from "../search.js";
 import { codexHome } from "../config.js";
 import { isErrno } from "../files.js";
 import { parseSessionId, type Summary } from "../contracts.js";
@@ -49,7 +50,16 @@ export type Transcript = {
   }[];
 };
 export class CodexStore {
-  constructor(private readonly home = codexHome) {}
+  constructor(
+    private readonly home = codexHome,
+    private readonly index = new SessionSearchIndex(),
+  ) {}
+  forget(sessionId: string) {
+    this.index.remove(sessionId);
+  }
+  close() {
+    this.index.close();
+  }
   private query({
     sql,
     parameters,
@@ -76,7 +86,7 @@ export class CodexStore {
     if (!row) throw new Error("Session not found");
     return row;
   }
-  search({
+  async search({
     query,
     archived,
     limit,
@@ -85,10 +95,40 @@ export class CodexStore {
     archived: boolean;
     limit: number;
   }) {
-    return this.query({
-      sql: "SELECT * FROM threads WHERE source IN ('cli', 'vscode', 'app-server') AND archived = ? AND (instr(lower(coalesce(name, '')), lower(?)) > 0 OR instr(lower(title), lower(?)) > 0 OR instr(lower(cwd), lower(?)) > 0) ORDER BY updated_at DESC LIMIT ?",
-      parameters: [Number(archived), query, query, query, limit],
-    }).map(summarize);
+    const rows = this.query({
+      sql: "SELECT * FROM threads WHERE source IN ('cli', 'vscode', 'app-server') AND archived = ? ORDER BY updated_at DESC",
+      parameters: [Number(archived)],
+    });
+    if (!query.trim())
+      return {
+        sessions: rows.map(summarize).sort(compareSessions).slice(0, limit),
+        warnings: [],
+      };
+    const warnings: string[] = [];
+    const candidates: Summary[] = [];
+    for (const row of rows) {
+      const summary = summarize(row);
+      try {
+        const info = await stat(row.rollout_path);
+        await this.index.sync(
+          summary,
+          JSON.stringify([row.rollout_path, info.size, info.mtimeMs]),
+          async () =>
+            (
+              await readTranscript({ path: row.rollout_path, limit: Infinity })
+            ).messages
+              .map((message) => message.text)
+              .join("\n"),
+        );
+      } catch (error) {
+        warnings.push(
+          `${summary.session_id}: transcript unavailable; only metadata was searched`,
+        );
+        await this.index.sync(summary, "unavailable", async () => "");
+      }
+      candidates.push(summary);
+    }
+    return { sessions: this.index.search(query, candidates, limit), warnings };
   }
   async read({ session_id, limit }: { session_id: string; limit: number }) {
     const row = this.get(session_id);
@@ -149,6 +189,7 @@ export async function readTranscript({
     if (
       record.type !== "response_item" ||
       payload.type !== "message" ||
+      payload.phase === "analysis" ||
       !["user", "assistant"].includes(payload.role ?? "")
     )
       continue;

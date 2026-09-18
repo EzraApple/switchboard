@@ -1,3 +1,6 @@
+import { SessionQueue } from "../queue.js";
+import { stat } from "node:fs/promises";
+import { SessionSearchIndex, compareSessions } from "../search.js";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { z } from "zod";
@@ -17,9 +20,14 @@ import { failure, OperationError } from "../errors.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { legacyStateDirectory, stateDirectory } from "../config.js";
 import { readJson, writeJson } from "../files.js";
+import { ClaudeBackground } from "./claude-background.js";
 import { ClaudeAPI } from "./claude-api.js";
 import { ClaudeWorkers } from "./claude-workers.js";
-import { readClaudeTranscript } from "./claude-transcript.js";
+import {
+  readClaudeTranscript,
+  claudeTranscriptPath,
+  readClaudeSearchText,
+} from "./claude-transcript.js";
 import { ClaudeLocalIPC } from "./claude-local-ipc.js";
 import { claudePeerMessage } from "./claude-message.js";
 import {
@@ -67,7 +75,8 @@ export class ClaudeAdapter implements Adapter {
     private readonly workers: Pick<
       ClaudeWorkers,
       "environment" | "resume" | "forget" | "close"
-    > = new ClaudeWorkers(),
+    > &
+      Partial<Pick<ClaudeWorkers, "findEnvironment">> = new ClaudeWorkers(),
     private readonly desktop: Pick<
       ClaudeDesktopStore,
       "list"
@@ -76,9 +85,25 @@ export class ClaudeAdapter implements Adapter {
       ClaudeLocalIPC,
       "send"
     > = new ClaudeLocalIPC(),
+    private readonly index = new SessionSearchIndex(),
+    private readonly directoryFile = join(stateDirectory, "sessions.json"),
+    private readonly background: Pick<
+      ClaudeBackground,
+      "wake"
+    > = new ClaudeBackground(desktop),
   ) {}
+  private readonly queue = new SessionQueue();
+  private directoriesLoading: Promise<Record<string, string>> | undefined;
   private directories: Record<string, string> | undefined;
-  private async getDirectories() {
+  private getDirectories() {
+    return (this.directoriesLoading ??= this.loadDirectories().catch(
+      (error) => {
+        this.directoriesLoading = undefined;
+        throw error;
+      },
+    ));
+  }
+  private async loadDirectories() {
     if (this.directories) return this.directories;
     const legacy = await readJson({
       path: join(legacyStateDirectory, "sessions.json"),
@@ -86,16 +111,18 @@ export class ClaudeAdapter implements Adapter {
       fallback: {},
     });
     return (this.directories = await readJson({
-      path: join(stateDirectory, "sessions.json"),
+      path: this.directoryFile,
       schema: directorySchema,
       fallback: legacy,
     }));
   }
   private async saveDirectories() {
-    await writeJson({
-      path: join(stateDirectory, "sessions.json"),
-      value: await this.getDirectories(),
-    });
+    await this.queue.run("directories", async () =>
+      writeJson({
+        path: this.directoryFile,
+        value: await this.getDirectories(),
+      }),
+    );
   }
   private async getSession(nativeId: string) {
     const response = z
@@ -135,81 +162,192 @@ export class ClaudeAdapter implements Adapter {
     return { row: await this.getSession(remoteSessionId(currentId)), local };
   }
   async search(input: SearchInput) {
-    const sessions: Summary[] = [];
+    const warnings: string[] = [];
     const locals = await this.desktop.list();
-    const mappedIds = new Set(
-      locals.flatMap((row) =>
-        [
-          ...row.bridgeSessionIds,
-          ...(row.liveBridgeSessionId ? [row.liveBridgeSessionId] : []),
-        ].map(remoteSessionId),
-      ),
+    const remote = await this.listRemoteSessions(warnings);
+    const candidates = collectSearchCandidates(
+      locals,
+      remote,
+      await this.getDirectories(),
+      input.archived,
     );
-    for (const local of locals) {
-      if (
-        local.isArchived !== input.archived ||
-        !`${local.title}\n${local.cwd}`
-          .toLowerCase()
-          .includes(input.query.toLowerCase())
-      )
-        continue;
-      const id = local.liveBridgeSessionId ?? local.bridgeSessionIds.at(-1);
-      if (!id) {
-        sessions.push({
-          session_id: `claude:${local.sessionId}`,
-          native_id: local.sessionId,
-          harness: "claude",
-          title: local.title,
-          cwd: local.cwd,
-          archived: local.isArchived,
-          updated_at: (local.lastActivityAt ?? 0) / 1000,
-          surface: "claude_desktop",
-          connection_status: "local_only",
-        });
-        continue;
-      }
-      try {
-        sessions.push(
-          desktopSummary(await this.getSession(remoteSessionId(id)), local),
-        );
-      } catch (error) {
-        sessions.push({
-          session_id: `claude:${remoteSessionId(id)}`,
-          native_id: remoteSessionId(id),
-          harness: "claude",
-          title: local.title,
-          cwd: local.cwd,
-          archived: local.isArchived,
-          surface: "claude_desktop",
-          connection_status: "unknown",
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
+    const summaries = candidates.map(({ summary }) => summary);
+    if (!input.query.trim())
+      return {
+        sessions: summaries.sort(compareSessions).slice(0, input.limit),
+        warnings,
+      };
+    const deadline = Date.now() + 60_000;
+    let next = 0;
+    await Promise.all(
+      Array.from({ length: 4 }, async () => {
+        while (next < candidates.length) {
+          const candidate = candidates[next++]!;
+          await this.indexSearchCandidate(
+            candidate,
+            remote,
+            deadline,
+            warnings,
+          );
+        }
+      }),
+    );
+    return {
+      sessions: this.index.search(input.query, summaries, input.limit),
+      warnings,
+    };
+  }
+  private async listRemoteSessions(warnings: string[]) {
+    const remote = new Map<string, z.infer<typeof sessionSchema>>();
+    const cursors = new Set<string>();
     let cursor: string | undefined;
-    for (let pageNumber = 0; pageNumber < 100; pageNumber++) {
+    try {
+      for (let pageNumber = 0; pageNumber < 100; pageNumber++) {
+        const params = new URLSearchParams({
+          limit: "100",
+          include_trigger_sessions: "true",
+          ...(cursor ? { cursor } : {}),
+        });
+        const page = pageSchema.parse(
+          await this.api.request({
+            method: "GET",
+            path: `/v1/code/sessions?${params}`,
+          }),
+        );
+        for (const row of page.data) remote.set(remoteSessionId(row.id), row);
+        cursor = page.next_cursor ?? undefined;
+        if (!cursor) break;
+        if (cursors.has(cursor)) {
+          warnings.push(
+            "Remote session listing returned a repeated cursor; listing is incomplete",
+          );
+          break;
+        }
+        cursors.add(cursor);
+      }
+      if (cursor && !warnings.length)
+        warnings.push("Remote session listing reached its page limit");
+    } catch (error) {
+      warnings.push(
+        `Remote sessions unavailable: ${error instanceof Error ? error.message : String(error)}; local Desktop history remains searchable`,
+      );
+    }
+    return remote;
+  }
+  private async indexSearchCandidate(
+    { summary, local }: SearchCandidate,
+    remote: Map<string, z.infer<typeof sessionSchema>>,
+    deadline: number,
+    warnings: string[],
+  ) {
+    try {
+      const path = local && claudeTranscriptPath(local);
+      const info = path
+        ? await stat(path).catch((error) => {
+            if (error.code === "ENOENT") return undefined;
+            throw error;
+          })
+        : undefined;
+      if (path && info) {
+        await this.index.sync(
+          summary,
+          JSON.stringify([path, info.size, info.mtimeMs]),
+          () => readClaudeSearchText(path),
+        );
+      } else if (
+        !summary.native_id.startsWith("local_") &&
+        remote.has(summary.native_id)
+      ) {
+        // Active sessions can acquire events without updating their title metadata.
+        const source = remote.get(summary.native_id)!;
+        const signature = JSON.stringify([
+          source.updated_at,
+          source.last_event_at,
+          source.connection_status === "connected"
+            ? Math.floor(Date.now() / 30_000)
+            : null,
+        ]);
+        await this.index.sync(summary, signature, async () =>
+          (
+            await this.remoteMessages(summary.native_id, {
+              all: true,
+              deadline,
+            })
+          )
+            .map((message) => message.text)
+            .join("\n"),
+        );
+      } else {
+        warnings.push(
+          `${summary.session_id}: no transcript available; only metadata was searched`,
+        );
+        await this.index.sync(summary, "metadata", async () => "");
+      }
+    } catch (error) {
+      warnings.push(
+        `${summary.session_id}: history unavailable (${error instanceof Error ? error.message : String(error)}); only metadata was searched`,
+      );
+      await this.index.sync(summary, "unavailable", async () => "");
+    }
+  }
+  private async remoteMessages(
+    nativeId: string,
+    options: { all?: boolean; deadline?: number } = {},
+  ) {
+    const events: z.infer<typeof eventSchema>[] = [];
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      if (options.deadline && Date.now() >= options.deadline)
+        throw new Error(
+          "History indexing time budget reached; repeat the search to continue",
+        );
       const params = new URLSearchParams({
         limit: "100",
-        include_trigger_sessions: "true",
         ...(cursor ? { cursor } : {}),
       });
-      const page = pageSchema.parse(
-        await this.api.request({
-          method: "GET",
-          path: `/v1/code/sessions?${params}`,
+      const response = z
+        .object({
+          data: z.array(z.unknown()),
+          next_cursor: z.string().nullish(),
+        })
+        .parse(
+          await this.api.request({
+            method: "GET",
+            path: `/v1/code/sessions/${nativeId}/events?${params}`,
+          }),
+        );
+      events.push(
+        ...response.data.flatMap((value) => {
+          const parsed = eventSchema.safeParse(value);
+          return parsed.success ? [parsed.data] : [];
         }),
       );
-      for (const row of page.data)
-        if (
-          !mappedIds.has(row.id) &&
-          (row.status === "archived") === input.archived &&
-          row.title.toLowerCase().includes(input.query.toLowerCase())
-        )
-          sessions.push(summarize(row));
-      cursor = page.next_cursor ?? undefined;
-      if (!cursor) break;
-    }
-    return sessions;
+      cursor = response.next_cursor ?? undefined;
+      if (cursor && cursors.has(cursor))
+        throw new Error("Remote history returned a repeated cursor");
+      if (cursor) cursors.add(cursor);
+    } while (options.all && cursor);
+    const seen = new Set<number>();
+    return events
+      .sort((left, right) => left.sequence_num - right.sequence_num)
+      .flatMap((event) => {
+        if (seen.has(event.sequence_num)) return [];
+        seen.add(event.sequence_num);
+        const message = event.payload.message;
+        if (!message) return [];
+        const text =
+          typeof message.content === "string"
+            ? message.content
+            : message.content
+                .flatMap((part) =>
+                  part.type === "text" && part.text ? [part.text] : [],
+                )
+                .join("\n");
+        return text
+          ? [{ role: message.role, text, timestamp: event.created_at }]
+          : [];
+      });
   }
   async read(input: ReadInput): Promise<Result> {
     const requestedId = parseSessionId(input.session_id).nativeId;
@@ -238,33 +376,7 @@ export class ClaudeAdapter implements Adapter {
     );
     const { row, local } = resolved,
       nativeId = row.id;
-    const response = z.object({ data: z.array(z.unknown()) }).parse(
-      await this.api.request({
-        method: "GET",
-        path: `/v1/code/sessions/${nativeId}/events?limit=100`,
-      }),
-    );
-    const events = response.data
-      .flatMap((value) => {
-        const parsed = eventSchema.safeParse(value);
-        return parsed.success ? [parsed.data] : [];
-      })
-      .sort((left, right) => left.sequence_num - right.sequence_num);
-    const messages = events.flatMap((event) => {
-      const message = event.payload.message;
-      if (!message) return [];
-      const text =
-        typeof message.content === "string"
-          ? message.content
-          : message.content
-              .flatMap((part) =>
-                part.type === "text" && part.text ? [part.text] : [],
-              )
-              .join("\n");
-      return text
-        ? [{ role: message.role, text, timestamp: event.created_at }]
-        : [];
-    });
+    const messages = await this.remoteMessages(nativeId);
     return {
       ...desktopSummary(row, local),
       cwd: local?.cwd ?? (await this.getDirectories())[nativeId],
@@ -312,6 +424,26 @@ export class ClaudeAdapter implements Adapter {
     }
   }
   async send(input: SendInput, newlyCreated = false): Promise<Result> {
+    return this.serialize(input.session_id, () =>
+      this.sendMessage(input, newlyCreated),
+    );
+  }
+  private async serialize<T>(sessionId: string, action: () => Promise<T>) {
+    const nativeId = parseSessionId(sessionId).nativeId;
+    const remoteId = remoteSessionId(nativeId);
+    const local = (await this.desktop.list()).find(
+      (row) =>
+        row.sessionId === nativeId ||
+        [...row.bridgeSessionIds, row.liveBridgeSessionId].some(
+          (id) => id && remoteSessionId(id) === remoteId,
+        ),
+    );
+    return this.queue.run(local?.sessionId ?? remoteId, action);
+  }
+  private async sendMessage(
+    input: SendInput,
+    newlyCreated = false,
+  ): Promise<Result> {
     const requestedId = parseSessionId(input.session_id).nativeId;
     const owner = (await this.desktop.list()).find(
       (row) =>
@@ -320,6 +452,17 @@ export class ClaudeAdapter implements Adapter {
           (id) => id && remoteSessionId(id) === remoteSessionId(requestedId),
         ),
     );
+    if (owner && !owner.livePid && owner.cliSessionId) {
+      if (owner.isArchived)
+        throw new Error("Unarchive the session before sending");
+      const resumed = await this.background.wake(owner);
+      return {
+        ...(await this.localIPC.send(resumed, input.prompt)),
+        session_id: input.session_id,
+        resumed: true,
+        resume_transport: "claude_background_cli",
+      };
+    }
     if (owner?.livePid && owner.messagingSocketPath) {
       if (owner.isArchived)
         throw new Error("Unarchive the session before sending");
@@ -350,7 +493,7 @@ export class ClaudeAdapter implements Adapter {
           "This Claude chat is not running, and Switchboard has no available connection to start it in the background. No message was sent.",
         );
       }
-      await this.workers.resume({ cwd, nativeId });
+      await this.reconnectSession(row, cwd);
       for (let attempt = 0; attempt < 20; attempt++) {
         row = await this.getSession(nativeId);
         if (row.connection_status === "connected") break;
@@ -402,7 +545,31 @@ export class ClaudeAdapter implements Adapter {
       receipt,
     };
   }
+  private async reconnectSession(
+    row: z.infer<typeof sessionSchema>,
+    cwd: string,
+  ) {
+    if (row.connection_status === "connected") return;
+    const environment = await this.workers.findEnvironment?.(cwd);
+    if (!environment) {
+      await this.workers.resume({ cwd, nativeId: row.id });
+      return;
+    }
+    if (row.environment_id !== environment)
+      throw new OperationError(
+        "CLAUDE_ENVIRONMENT_UNAVAILABLE",
+        "This chat belongs to an older Claude environment; a different environment now serves its folder. Switchboard cannot resume it without disrupting other sessions. No message was sent.",
+      );
+    await this.api.request({
+      method: "POST",
+      path: `/v1/environments/${environment}/bridge/reconnect`,
+      body: { session_id: row.id },
+    });
+  }
   async update(input: UpdateInput): Promise<Result> {
+    return this.serialize(input.session_id, () => this.updateSession(input));
+  }
+  private async updateSession(input: UpdateInput): Promise<Result> {
     await this.requireRemoteLifecycle(input.session_id);
     const { nativeId } = parseSessionId(input.session_id),
       applied: string[] = [];
@@ -424,7 +591,8 @@ export class ClaudeAdapter implements Adapter {
         applied.push("archived");
         if (!input.archived) {
           const cwd = (await this.getDirectories())[nativeId];
-          if (cwd) await this.workers.resume({ cwd, nativeId });
+          if (cwd)
+            await this.reconnectSession(await this.getSession(nativeId), cwd);
           else
             return {
               session_id: input.session_id,
@@ -441,6 +609,9 @@ export class ClaudeAdapter implements Adapter {
     }
   }
   async delete(input: DeleteInput): Promise<Result> {
+    return this.serialize(input.session_id, () => this.deleteSession(input));
+  }
+  private async deleteSession(input: DeleteInput): Promise<Result> {
     await this.requireRemoteLifecycle(input.session_id);
     const { nativeId } = parseSessionId(input.session_id);
     await this.api.request({
@@ -448,10 +619,17 @@ export class ClaudeAdapter implements Adapter {
       path: `/v1/code/sessions/${nativeId}`,
     });
     this.workers.forget(nativeId);
-    return { session_id: input.session_id, status: "deleted" };
+    const result: Result = { session_id: input.session_id, status: "deleted" };
+    try {
+      this.index.remove(input.session_id);
+    } catch {
+      result.warning = "Session deleted; local search cache cleanup failed";
+    }
+    return result;
   }
   close() {
     this.workers.close();
+    this.index.close();
   }
   private async requireRemoteLifecycle(sessionId: string) {
     const nativeId = parseSessionId(sessionId).nativeId;
@@ -505,4 +683,54 @@ function summarize(row: z.infer<typeof sessionSchema>): Summary {
     surface: "remote_control",
     origin: row.config?.origin,
   };
+}
+
+type SearchCandidate = { summary: Summary; local?: DesktopSession };
+function collectSearchCandidates(
+  locals: DesktopSession[],
+  remote: Map<string, z.infer<typeof sessionSchema>>,
+  directories: Record<string, string>,
+  archived: boolean,
+) {
+  const mappedIds = new Set(
+    locals.flatMap((row) =>
+      [
+        ...row.bridgeSessionIds,
+        ...(row.liveBridgeSessionId ? [row.liveBridgeSessionId] : []),
+      ].map(remoteSessionId),
+    ),
+  );
+  const candidates: SearchCandidate[] = [];
+  for (const local of locals) {
+    if (local.isArchived !== archived) continue;
+    const id = local.liveBridgeSessionId ?? local.bridgeSessionIds.at(-1);
+    const row = id ? remote.get(remoteSessionId(id)) : undefined;
+    const nativeId = id ? remoteSessionId(id) : local.sessionId;
+    candidates.push({
+      local,
+      summary: row
+        ? desktopSummary(row, local)
+        : {
+            session_id: `claude:${nativeId}`,
+            native_id: nativeId,
+            harness: "claude",
+            title: local.title,
+            cwd: local.cwd,
+            archived: local.isArchived,
+            updated_at: (local.lastActivityAt ?? 0) / 1000,
+            surface: "claude_desktop",
+            connection_status: id ? "unknown" : "local_only",
+          },
+    });
+  }
+  for (const row of remote.values()) {
+    if (
+      !mappedIds.has(remoteSessionId(row.id)) &&
+      (row.status === "archived") === archived
+    )
+      candidates.push({
+        summary: { ...summarize(row), cwd: directories[row.id] },
+      });
+  }
+  return candidates;
 }

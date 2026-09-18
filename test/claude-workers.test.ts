@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, rm, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
+import { findClaudeExecutable } from "../src/adapters/claude-workers.js";
 import { queryWorker } from "../src/adapters/claude-worker-host.js";
 
 const run = promisify(execFile);
@@ -99,5 +100,29 @@ test("ClaudeWorkers reuses its host after close and a fresh manager process", as
   } finally {
     await queryWorker(socket, key, true).catch(() => {});
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("worker launches rediscover Claude after Desktop upgrades and ignore incomplete versions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-versions-"));
+  const binary = (version: string) =>
+    join(root, version, "claude.app/Contents/MacOS/claude");
+  try {
+    await mkdir(join(binary("2.1.9"), ".."), { recursive: true });
+    await writeFile(binary("2.1.9"), "old");
+    assert.equal(
+      await findClaudeExecutable(root, "/fallback"),
+      binary("2.1.9"),
+    );
+    await mkdir(join(binary("2.1.10"), ".."), { recursive: true });
+    await writeFile(binary("2.1.10"), "new");
+    await rm(join(root, "2.1.9"), { recursive: true });
+    await mkdir(join(root, "2.1.11"));
+    assert.equal(
+      await findClaudeExecutable(root, "/fallback"),
+      binary("2.1.10"),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

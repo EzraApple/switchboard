@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { SessionSearchIndex } from "../src/search.js";
 import { ClaudeAdapter } from "../src/adapters/claude.js";
 import type { DesktopSession } from "../src/adapters/claude-desktop-store.js";
 const local: DesktopSession = {
@@ -83,12 +84,13 @@ function fixture({
         throw new Error("fixture has no local inbox");
       },
     },
+    new SessionSearchIndex(":memory:"),
   );
   return { adapter, calls, resumes: () => resumes };
 }
 test("Desktop title search finds a generated-title remote session omitted from listing matches, without duplicates", async () => {
   const { adapter } = fixture();
-  const found = await adapter.search({
+  const { sessions: found } = await adapter.search({
     query: "Chat session",
     archived: false,
     limit: 10,
@@ -98,7 +100,8 @@ test("Desktop title search finds a generated-title remote session omitted from l
   assert.equal(found[0].title, "Chat session");
   assert.equal(found[0].remote_title, "generated-title");
   assert.equal(
-    (await adapter.search({ query: "", archived: false, limit: 10 })).length,
+    (await adapter.search({ query: "", archived: false, limit: 10 })).sessions
+      .length,
     1,
   );
 });
@@ -139,7 +142,7 @@ test("local-only sessions are discoverable and fail before submission", async ()
   const { adapter, calls } = fixture({
     desktop: [{ ...local, bridgeSessionIds: [] }],
   });
-  const rows = await adapter.search({
+  const { sessions: rows } = await adapter.search({
     query: "Chat session",
     archived: false,
     limit: 10,
@@ -185,4 +188,174 @@ test("sender envelope keeps peer authority and cannot be closed by the prompt", 
   assert.ok(body.includes('from-name=\\"Switchboard\\"'));
   assert.ok(body.includes("<\\\\/cross-session-message>"));
   assert.equal(body.includes("client_platform"), false);
+});
+
+test("search paginates remote conversation text beyond the latest events and survives an API outage for local titles", async () => {
+  const calls: string[] = [];
+  let outage = false;
+  const adapter = new ClaudeAdapter(
+    {
+      async request({ path }) {
+        calls.push(path);
+        if (outage) throw new Error("offline");
+        if (path.includes("/sessions?"))
+          return {
+            data: [
+              {
+                id: "cse_history",
+                title: "ordinary title",
+                status: "idle",
+                updated_at: "2026-09-01T00:00:00Z",
+              },
+            ],
+          };
+        const older = path.includes("cursor=older");
+        return {
+          data: [
+            {
+              sequence_num: older ? 1 : 2,
+              payload: {
+                message: {
+                  role: "assistant",
+                  content: older
+                    ? "quasar migration decisions"
+                    : "recent answer",
+                },
+              },
+            },
+          ],
+          next_cursor: older ? null : "older",
+        };
+      },
+    },
+    {
+      async environment() {
+        return "env";
+      },
+      async resume() {},
+      forget() {},
+      close() {},
+    },
+    {
+      async list() {
+        return [{ ...local, bridgeSessionIds: [] }];
+      },
+    },
+    {
+      async send() {
+        throw new Error("unused");
+      },
+    },
+    new SessionSearchIndex(":memory:"),
+  );
+  try {
+    const result = await adapter.search({
+      query: "quasar",
+      archived: false,
+      limit: 10,
+    });
+    assert.equal(result.sessions[0]!.session_id, "claude:cse_history");
+    assert.ok(calls.some((path) => path.includes("cursor=older")));
+    const reads = calls.filter((path) => path.includes("/events?")).length;
+    await adapter.search({ query: "quasar", archived: false, limit: 10 });
+    assert.equal(
+      calls.filter((path) => path.includes("/events?")).length,
+      reads,
+    );
+    outage = true;
+    const offline = await adapter.search({
+      query: "Chat",
+      archived: false,
+      limit: 10,
+    });
+    assert.equal(offline.sessions[0]!.title, "Chat session");
+    assert.ok(offline.warnings.some((warning) => warning.includes("offline")));
+  } finally {
+    adapter.close();
+  }
+});
+
+test("disconnected sessions reuse their live environment and never launch a competing folder server", async () => {
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const root = await mkdtemp(join(tmpdir(), "sb-reconnect-"));
+  const directoryFile = join(root, "directories.json");
+  await writeFile(
+    directoryFile,
+    JSON.stringify({ cse_reconnect: "/tmp/project" }),
+  );
+  let connected = false;
+  let environment = "env_original";
+  let resumes = 0;
+  const posts: string[] = [];
+  const adapter = new ClaudeAdapter(
+    {
+      async request({ method, path }) {
+        if (method === "POST") {
+          posts.push(path);
+          if (path.endsWith("/bridge/reconnect")) connected = true;
+          return {};
+        }
+        return {
+          session: {
+            id: "cse_reconnect",
+            title: "old session",
+            status: "idle",
+            environment_id: "env_original",
+            connection_status: connected ? "connected" : "disconnected",
+          },
+        };
+      },
+    },
+    {
+      async environment() {
+        return environment;
+      },
+      async findEnvironment() {
+        return environment;
+      },
+      async resume() {
+        resumes++;
+      },
+      forget() {},
+      close() {},
+    },
+    {
+      async list() {
+        return [];
+      },
+    },
+    {
+      async send() {
+        throw new Error("unused");
+      },
+    },
+    new SessionSearchIndex(":memory:"),
+    directoryFile,
+  );
+  try {
+    const result = await adapter.send({
+      session_id: "claude:cse_reconnect",
+      prompt: "hello",
+    });
+    assert.equal(result.status, "accepted");
+    assert.deepEqual(posts, [
+      "/v1/environments/env_original/bridge/reconnect",
+      "/v1/code/sessions/cse_reconnect/events",
+    ]);
+    assert.equal(resumes, 0);
+    connected = false;
+    environment = "env_replacement";
+    posts.length = 0;
+    await assert.rejects(
+      adapter.send({ session_id: "claude:cse_reconnect", prompt: "hello" }),
+      { code: "CLAUDE_ENVIRONMENT_UNAVAILABLE" },
+    );
+    assert.deepEqual(posts, []);
+    assert.equal(resumes, 0);
+  } finally {
+    adapter.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });

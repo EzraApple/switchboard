@@ -16,7 +16,7 @@ import {
   type SendInput,
   type UpdateInput,
 } from "../contracts.js";
-import { errorMessage, failure } from "../errors.js";
+import { errorMessage, failure, OperationError } from "../errors.js";
 import { CodexEngine } from "./codex-engine.js";
 import { CodexStore } from "./codex-store.js";
 import {
@@ -43,6 +43,8 @@ type Desktop = Pick<CodexIPC, "send" | "broadcast" | "close" | "findOwner">;
 export class CodexAdapter implements Adapter {
   private engineInstance: Engine | undefined;
   private readonly owned = new Map<string, Engine>();
+  private readonly turnVersions = new Map<string, number>();
+  private readonly turnStates = new Map<string, string | null>();
   private readonly queues = new Map<string, Promise<unknown>>();
   private readonly createEngine: (
     onNotification: (method: string, params: unknown) => void,
@@ -83,7 +85,16 @@ export class CodexAdapter implements Adapter {
     const connection =
       this.owned.get(nativeId)?.transport ??
       (this.owned.has(nativeId) ? "codex_app_server" : "none");
-    const state = { ...transcript, switchboard_connection: connection };
+    const state = {
+      ...transcript,
+      switchboard_connection: connection,
+      ...(this.turnStates.has(nativeId)
+        ? {
+            status: this.turnStates.get(nativeId) ? "active" : "idle",
+            turn_id: this.turnStates.get(nativeId),
+          }
+        : {}),
+    };
     try {
       const desktop = await this.openDesktop();
       try {
@@ -214,19 +225,36 @@ export class CodexAdapter implements Adapter {
       session_id: input.session_id,
       limit: 1,
     });
-    const active = transcript.status === "active";
+    const activeTurnId = this.turnStates.has(nativeId)
+      ? this.turnStates.get(nativeId)
+      : transcript.status === "active"
+        ? transcript.turn_id
+        : null;
+    const active = Boolean(activeTurnId);
+    if (
+      !this.turnStates.has(nativeId) &&
+      transcript.status === "active" &&
+      !activeTurnId
+    )
+      throw new OperationError(
+        "TURN_STATE_UNAVAILABLE",
+        "The current turn ID is unavailable. Read the session again before sending; no message was sent.",
+      );
+    const version = this.turnVersions.get(nativeId) ?? 0;
     const response = await this.owned.get(nativeId)!.call({
       method: active ? "turn/steer" : "turn/start",
       params: {
         threadId: nativeId,
         input: [{ type: "text", text: input.prompt, text_elements: [] }],
-        ...(active ? { expectedTurnId: transcript.turn_id } : {}),
+        ...(active ? { expectedTurnId: activeTurnId } : {}),
       },
     });
     const turnId = active
-      ? transcript.turn_id
+      ? activeTurnId
       : z.object({ turn: z.object({ id: z.string() }) }).parse(response).turn
           .id;
+    if ((this.turnVersions.get(nativeId) ?? 0) === version)
+      this.turnStates.set(nativeId, turnId ?? null);
     return {
       session_id: input.session_id,
       status: "accepted",
@@ -288,6 +316,11 @@ export class CodexAdapter implements Adapter {
     await this.owned.get(nativeId)?.close();
     this.owned.delete(nativeId);
     const result: Result = { session_id: input.session_id, status: "deleted" };
+    try {
+      if (this.store instanceof CodexStore) this.store.forget(input.session_id);
+    } catch {
+      result.warning = "Session deleted; local search cache cleanup failed";
+    }
     await this.refresh({ result, nativeId, archived: true });
     return result;
   }
@@ -300,10 +333,20 @@ export class CodexAdapter implements Adapter {
         .safeParse(params);
       if (!parsed.success) return;
       const { turn, threadId } = parsed.data;
+      if (method !== "turn/started" && method !== "turn/completed") return;
+      this.turnVersions.set(
+        threadId,
+        (this.turnVersions.get(threadId) ?? 0) + 1,
+      );
       threadIds.add(threadId);
-      if (method === "turn/started") activeTurns.add(turn.id);
+      if (method === "turn/started") {
+        activeTurns.add(turn.id);
+        this.turnStates.set(threadId, turn.id);
+      }
       if (method !== "turn/completed") return;
       activeTurns.delete(turn.id);
+      if (this.turnStates.get(threadId) === turn.id)
+        this.turnStates.set(threadId, null);
       const ownerId = [...this.owned].find(
         ([, value]) => value === engine,
       )?.[0];
@@ -323,6 +366,10 @@ export class CodexAdapter implements Adapter {
         if (activeTurns.size > 0) return;
         await engine.close();
         this.owned.delete(ownerId);
+        for (const threadId of threadIds) {
+          this.turnStates.delete(threadId);
+          this.turnVersions.delete(threadId);
+        }
         await this.refresh({ nativeId: ownerId, result: {} });
       }).catch((error) =>
         console.error("Codex ownership release failed:", errorMessage(error)),
@@ -415,6 +462,7 @@ export class CodexAdapter implements Adapter {
     return first.id;
   }
   close() {
+    if (this.store instanceof CodexStore) this.store.close();
     void this.engineInstance?.close();
     for (const engine of this.owned.values()) void engine.close();
   }

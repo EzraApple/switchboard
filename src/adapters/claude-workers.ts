@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, readdir, unlink } from "node:fs/promises";
+import { mkdir, readdir, unlink, access } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
@@ -12,32 +12,19 @@ export { startupDiagnostic } from "./claude-worker-host.js";
 
 export class ClaudeWorkers {
   private readonly starting = new Map<string, Promise<string>>();
-  private binary: string | undefined;
-  private async executable() {
-    if (this.binary) return this.binary;
-    if (process.env.SWITCHBOARD_CLAUDE_BIN)
-      return (this.binary = process.env.SWITCHBOARD_CLAUDE_BIN);
-    const root = join(
-      homedir(),
-      "Library/Application Support/Claude/claude-code",
-    );
-    let versions: string[] = [];
-    try {
-      versions = (await readdir(root)).filter((value) =>
-        /^\d+\.\d+\.\d+$/.test(value),
-      );
-    } catch {
-      /* The standalone CLI is also supported. */
-    }
-    versions.sort((left, right) =>
-      right.localeCompare(left, undefined, { numeric: true }),
-    );
-    return (this.binary = versions[0]
-      ? join(root, versions[0], "claude.app/Contents/MacOS/claude")
-      : join(homedir(), ".local/bin/claude"));
-  }
   environment(cwd: string) {
     return this.ensureWorker(cwd);
+  }
+  async findEnvironment(cwd: string) {
+    const key = workerKey(cwd);
+    try {
+      const state = await queryWorker(workerSocket(key), key);
+      return state.status === "ready" ? state.value : undefined;
+    } catch (error) {
+      if (isErrno(error, "ENOENT") || isErrno(error, "ECONNREFUSED"))
+        return undefined;
+      throw error;
+    }
   }
   async resume({ cwd, nativeId }: { cwd: string; nativeId: string }) {
     await this.ensureWorker(cwd, nativeId);
@@ -87,7 +74,7 @@ export class ClaudeWorkers {
           fileURLToPath(new URL("./claude-worker-host.js", import.meta.url)),
           socketPath,
           key,
-          await this.executable(),
+          await findClaudeExecutable(),
           cwd,
           ...(nativeId ? [nativeId] : []),
         ],
@@ -121,4 +108,33 @@ function workerKey(cwd: string, nativeId?: string) {
 }
 function workerSocket(key: string) {
   return join(stateDirectory, "worker-hosts", `${key}.sock`);
+}
+
+export async function findClaudeExecutable(
+  root = join(homedir(), "Library/Application Support/Claude/claude-code"),
+  fallback = join(homedir(), ".local/bin/claude"),
+) {
+  if (process.env.SWITCHBOARD_CLAUDE_BIN)
+    return process.env.SWITCHBOARD_CLAUDE_BIN;
+  let versions: string[] = [];
+  try {
+    versions = (await readdir(root)).filter((value) =>
+      /^\d+\.\d+\.\d+$/.test(value),
+    );
+  } catch (error) {
+    if (!isErrno(error, "ENOENT")) throw error;
+  }
+  versions.sort((left, right) =>
+    right.localeCompare(left, undefined, { numeric: true }),
+  );
+  for (const version of versions) {
+    const binary = join(root, version, "claude.app/Contents/MacOS/claude");
+    try {
+      await access(binary);
+      return binary;
+    } catch (error) {
+      if (!isErrno(error, "ENOENT")) throw error;
+    }
+  }
+  return fallback;
 }

@@ -6,13 +6,21 @@ test("environment discovery allows no mutations, subpaths, or arbitrary URLs", a
   const api = new ClaudeAPI();
   for (const input of [
     { method: "POST", path: "/v1/environment_providers" },
+    {
+      method: "POST",
+      path: "/v1/environments/env_test/bridge/reconnect",
+      body: { session_id: "invalid" },
+    },
+    { method: "GET", path: "/v1/environments/env_test/bridge/reconnect" },
+    {
+      method: "POST",
+      path: "/v1/environments/env_test/bridge/reconnect",
+      body: { session_id: "cse_test", extra: true },
+    },
     { method: "DELETE", path: "/v1/environment_providers" },
     { method: "GET", path: "/v1/environment_providers/cloud/create" },
     { method: "GET", path: "https://example.com/v1/environment_providers" },
   ]) {
-    await assert.rejects(
-      api.request(input),
-      /Only the Claude session API and read-only environment discovery are allowed/,
-    );
+    await assert.rejects(api.request(input), /Only the Claude session API/);
   }
 });
