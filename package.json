@@ -2,7 +2,10 @@
   "name": "@ezraapple/switchboard",
   "version": "0.1.0",
   "description": "One local MCP for sessions across agent harnesses.",
-  "private": true,
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "bin": {
     "switchboard": "dist/cli.js"
@@ -17,7 +20,7 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc",
     "test": "tsx --test test/*.test.ts",
     "test:live": "tsx test/lifecycle.ts",
     "prepack": "npm run build",

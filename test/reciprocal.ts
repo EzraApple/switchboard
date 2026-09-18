@@ -4,7 +4,11 @@ import { writeFile, open } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 const root = fileURLToPath(new URL("..", import.meta.url));
-const receiptPath = join(root, "evidence/reciprocal-dispatch.json");
+const receiptPath = join(
+  root,
+  "evidence",
+  process.argv[2] ?? "reciprocal-dispatch.json",
+);
 await (await open(receiptPath, "wx")).close();
 const cwd = process.env.SWITCHBOARD_TEST_CWD;
 if (!cwd)
@@ -20,7 +24,12 @@ const client = new Client({
 await client.connect(
   new StdioClientTransport({
     command: process.execPath,
-    args: [join(root, "dist/cli.js")],
+    args: [process.env.SWITCHBOARD_TEST_CLI ?? join(root, "dist/cli.js")],
+    env: Object.fromEntries(
+      Object.entries(process.env).filter(
+        (entry): entry is [string, string] => entry[1] !== undefined,
+      ),
+    ),
   }),
 );
 try {

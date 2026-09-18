@@ -110,7 +110,7 @@ This proves continuation of the original local conversation, not launch of Deskt
 Before publishing the first package:
 
 - Run both harnesses' live lifecycle and reciprocal MCP checks against the final installed tarball, then inspect actual replies and Desktop follow-up behavior. Repeat with a clean setup or second installation to check onboarding assumptions.
-- Choose and add a license; the repository currently has no license file. Confirm the scoped package name, version, npm account access, and intended public visibility. Remove `private: true` only when ready to publish.
+- The MIT license is included in `LICENSE` and package metadata. Confirm the scoped package name, version, npm account access, and public visibility. `publishConfig.access` is set to `public` for the scoped package.
 - Verify the final tarball contents, fresh installation, executable entry point, and MCP tool discovery. Keep credentials, evidence, native session transcripts, and machine-specific state out of the package.
 - Keep shared Codex mode experimental. Document dormant-wake CLI requirements and Desktop UI limitations, CLI reauthentication, worker/reboot recovery, approval relay, and first-turn Codex UI behavior as preview limitations unless resolved before release.
 

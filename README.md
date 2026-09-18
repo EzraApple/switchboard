@@ -2,9 +2,11 @@
 
 Let an agent in Claude Code start a Codex task, read its response, and continue the conversation—or do the same in the other direction. Switchboard exposes six MCP tools for managing native sessions across both harnesses, with one shared interface.
 
-**Early local preview. The source is public; the npm package is not published.** Run from a checkout while it is being tested. `private: true` remains enabled in `package.json`.
+**Early preview.** Available as `@ezraapple/switchboard` on npm. Native session operations work in local tests; review the Desktop and compatibility limits below before relying on it.
 
 The goal is to work with sessions you can see in your Desktop apps. Native session creation and cross-harness prompting work in local tests; immediate sidebar visibility and project grouping still have limitations. This is an independent project. Some adapter interfaces are private and may change.
+
+Licensed under the [MIT License](LICENSE).
 
 ## Requirements
 
@@ -16,6 +18,19 @@ The goal is to work with sessions you can see in your Desktop apps. Native sessi
 Claude session creation uses the **Claude Code CLI login**, which is separate from being signed into Claude Desktop. Check `claude auth status`; if it reports logged out, run `claude auth login --claudeai` and complete its browser flow. Switchboard does not refresh expired OAuth tokens itself.
 
 Switchboard uses your existing harness logins. There is no separate Switchboard account or API key to paste. Agent turns still use your normal provider account and its limits.
+
+## Install from npm
+
+Register the package in either or both harnesses:
+
+```sh
+codex mcp add switchboard -- npx -y @ezraapple/switchboard@0.1.0
+claude mcp add --scope user --transport stdio switchboard -- npx -y @ezraapple/switchboard@0.1.0
+```
+
+Start a fresh session after registration. `npx` installs the package on first use; Node.js and the harness executables must already be installed and signed in. These commands pin the preview version so updates are explicit. For Desktop environments with a different PATH, use the source setup below with absolute executable paths.
+
+Switchboard serves MCP over stdio. Running `npx -y @ezraapple/switchboard@0.1.0` directly waits for an MCP client; it does not open a chat interface.
 
 ## Run from source
 
@@ -196,9 +211,9 @@ Run `npm test` for the build and focused tests, and `npm run format:check` for f
 
 Useful issue reports include OS, Node and harness versions, operation, structured error code, and whether the native session changed or only its UI failed to refresh. Remove credentials, private prompts, and transcripts before posting.
 
-## Before npm publication
+## Package releases
 
-The provisional package name is `@ezraapple/switchboard`; the unscoped name is taken. No registry install command is available yet. Use the checkout above, or make a local tarball with `npm pack` and run it with `npm exec --package=/absolute/path/to/the.tgz -- switchboard`. Packing does not publish anything. npm publication remains disabled during local testing.
+The package name is `@ezraapple/switchboard`; the executable is `switchboard`. You can test an unpublished build with `npm pack` and `npm exec --package=/absolute/path/to/the.tgz -- switchboard`. Packing does not publish anything. Maintainers should follow the release checks in [TESTING.md](TESTING.md) before publishing.
 
 ## Claude worker behavior
 
