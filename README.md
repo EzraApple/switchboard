@@ -24,15 +24,15 @@ Switchboard uses your existing harness logins. There is no separate Switchboard 
 Register the package in either or both harnesses:
 
 ```sh
-codex mcp add switchboard -- npx -y @ezraapple/switchboard@0.1.0
-claude mcp add --scope user --transport stdio switchboard -- npx -y @ezraapple/switchboard@0.1.0
+codex mcp add switchboard -- npx -y @ezraapple/switchboard@latest
+claude mcp add --scope user --transport stdio switchboard -- npx -y @ezraapple/switchboard@latest
 ```
 
-Start a fresh session after registration. `npx` installs the package on first use; Node.js and the harness executables must already be installed and signed in. These commands pin the preview version so updates are explicit. For Desktop environments with a different PATH, use the source setup below with absolute executable paths.
+Start a fresh session after registration. `npx` installs the package on first use; Node.js and the harness executables must already be installed and signed in. `@latest` selects the current npm release when the MCP client launches. An already-running backend keeps its loaded version until restarted; see [configuration and lifecycle](#configuration-and-lifecycle) when upgrading. For Desktop environments with a different PATH, use an absolute path to `npx`.
 
-Switchboard serves MCP over stdio. Running `npx -y @ezraapple/switchboard@0.1.0` directly waits for an MCP client; it does not open a chat interface.
+Switchboard serves MCP over stdio. Running `npx -y @ezraapple/switchboard@latest` directly waits for an MCP client; the registration commands above connect it to a harness.
 
-When launching from Switchboard's own checkout, npm can select the local package instead of the published version. Use `npx --prefix "$HOME" -y @ezraapple/switchboard@0.1.0` in that case. In MCP configuration, replace `$HOME` with your absolute home directory because argument arrays do not expand shell variables.
+To pin a release, replace `@latest` with `@0.1.0`. When launching that pinned command from Switchboard's own checkout, npm can select the local root package; add `--prefix "$HOME"` to the `npx` arguments in that case. The recommended `@latest` command avoids this checkout-specific workaround. In MCP argument arrays, use an absolute path rather than `$HOME`, since those arrays do not expand shell variables.
 
 ## Run from source
 
