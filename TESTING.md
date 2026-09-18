@@ -105,9 +105,17 @@ A fresh tarball contained 52 allowlisted files and installed successfully into a
 
 This proves continuation of the original local conversation, not launch of Desktop's own engine or full Desktop UI/tool parity. Remote-only sessions with expired environments still need recovery outside this path.
 
+## September 18 npm release
+
+Published `@ezraapple/switchboard@0.1.0` with the MIT license. The registry version's integrity matches the tested tarball. A clean build removes stale compiled files before packing; the release contains 51 allowlisted files. All 41 tests, formatting, and build checks passed.
+
+Fresh local installations passed both harnesses' full lifecycle, including actual initial and follow-up replies, rename/search, archive/restore, and deletion. The final package's compiled runtime files were byte-identical to the lifecycle-tested installation after obsolete output was removed. A Claude → Codex → Claude round trip passed through the normal shared MCP daemon, with native tool calls and the descendant's exact reply checked in transcripts. An initial attempt mixing isolated and normally registered daemons hit a folder-serving conflict; that was a test setup limitation.
+
+After publication, a fresh npm cache downloaded and launched the package through `npx`, exposed all six tools, and read back an actual Claude reply using an isolated daemon whose entrypoint was inside npm's `_npx` directory. Launching from this repository requires `--prefix` pointing outside the checkout to avoid npm selecting the local root package. Registry package metadata initially returned 404 after publish acceptance; installation succeeded once it became available.
+
 ## Package release checklist
 
-Before publishing the first package:
+Before publishing a new package version:
 
 - Run both harnesses' live lifecycle and reciprocal MCP checks against the final installed tarball, then inspect actual replies and Desktop follow-up behavior. Repeat with a clean setup or second installation to check onboarding assumptions.
 - The MIT license is included in `LICENSE` and package metadata. Confirm the scoped package name, version, npm account access, and public visibility. `publishConfig.access` is set to `public` for the scoped package.

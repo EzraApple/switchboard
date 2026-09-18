@@ -32,6 +32,8 @@ Start a fresh session after registration. `npx` installs the package on first us
 
 Switchboard serves MCP over stdio. Running `npx -y @ezraapple/switchboard@0.1.0` directly waits for an MCP client; it does not open a chat interface.
 
+When launching from Switchboard's own checkout, npm can select the local package instead of the published version. Use `npx --prefix "$HOME" -y @ezraapple/switchboard@0.1.0` in that case. In MCP configuration, replace `$HOME` with your absolute home directory because argument arrays do not expand shell variables.
+
 ## Run from source
 
 ```sh
